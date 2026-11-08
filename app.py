@@ -745,9 +745,15 @@ def page_settings():
     st.header(t("settings"))
     st.write("**Providers:** " + ", ".join(S.provider_names()))
     table(pd.DataFrame({t("c_policy"): list(S.clients()), t("c_company"): list(S.clients().values())}))
-    st.success(t("remember_on")) if S.secret_cookie() else st.warning(t("remember_off"))
+    if S.secret_cookie():
+        st.success(t("remember_on"))
+    else:
+        st.warning(t("remember_off"))
     st.subheader(t("set_scan"))
-    st.success(t("scan_ai_on")) if ocr.claude_available() else st.warning(t("scan_no_ai"))
+    if ocr.claude_available():
+        st.success(t("scan_ai_on"))
+    else:
+        st.warning(t("scan_no_ai"))
     st.subheader(t("set_notif"))
     if S.SB:
         st.success(t("sb_ok"))
