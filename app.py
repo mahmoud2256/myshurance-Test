@@ -107,7 +107,7 @@ def can_edit():
 
 
 def policy_label(no):
-    return f"{no} - {S.CLIENTS_MAP.get(no, '')}"
+    return f"{no} - {S.school_name(no)}"
 
 
 def all_or(label_fn):
@@ -124,7 +124,7 @@ def member_table(df, reqs):
     return pd.DataFrame({
         t("c_idx"): range(1, len(df) + 1),
         t("c_name"): df["name"], t("c_staff"): dash(df["staff_no"]), t("c_card"): dash(df["card_no"]),
-        t("c_policy"): df["policy_no"], t("c_company"): df["policy_no"].map(lambda p: S.CLIENTS_MAP.get(str(p), "—")),
+        t("c_policy"): df["policy_no"], t("c_company"): df["policy_no"].map(lambda p: S.school_name(p) or "—"),
         t("c_cat"): dash(df["category"]), t("c_dep"): dash(df["dependency"]),
         t("c_dob"): df["dob"].map(S.fmt_date),
         t("c_gender"): df["gender"].map(lambda g: t("g_" + g) if g in ("M", "F") else "—"),
@@ -140,6 +140,60 @@ def date_or_none(iso):
 
 
 # ───────────────────────── الدخول ─────────────────────────
+AUTH_COOKIE = "ms_auth"
+
+
+def remember(token):
+    """يجهّز كوكي "تذكّرني" (بيتكتب في المتصفح في الـ run الجاي). من غير COOKIE_SECRET مبيحصلش حاجة."""
+    st.session_state.pop("_no_auto", None)
+    if token:
+        st.session_state["_cookie_out"] = ("set", token)
+
+
+def emit_cookie():
+    act = st.session_state.pop("_cookie_out", None)
+    if not act:
+        return
+    kind, tok = act
+    val, age = (tok, S.SESSION_TTL) if kind == "set" else ("", 0)  # التوكن حروف آمنة فقط (base64url + hex)
+    js = (f'<script>(function(){{var s="{AUTH_COOKIE}={val}; path=/; max-age={age}; SameSite=Lax";'
+          f'if(location.protocol==="https:")s+="; Secure";document.cookie=s;}})();</script>')
+    try:
+        st.html(js, unsafe_allow_javascript=True)
+    except TypeError:  # نسخة Streamlit أقدم
+        import streamlit.components.v1 as components
+        components.html(js, height=0)
+
+
+def request_cookies():
+    try:
+        return dict(st.context.cookies)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def try_auto_login():
+    """لو فيه كوكي دخول سليم (توقيع + لسه ما انتهاش + الباسورد/الكود ما اتغيرش) ندخّله من غير باسورد."""
+    ss = st.session_state
+    if "role" in ss or ss.get("_no_auto") or not S.secret_cookie():
+        return
+    d = S.read_session_token(request_cookies().get(AUTH_COOKIE))
+    if not d:
+        return
+    if d["r"] in ("admin", "viewer"):
+        pw = S.secret("ADMIN_PASSWORD" if d["r"] == "admin" else "VIEWER_PASSWORD")
+        if pw and S.token_fp(pw) == d.get("f"):
+            ss.role, ss.user_name = d["r"], d.get("n") or ""
+        return
+    m = S.load("members")
+    hit = m[m["id"] == d.get("m")]
+    if hit.empty:
+        return
+    r = hit.iloc[0]
+    if (S.nn(r["status"]) or "active") == "active" and S.nn(r.get("portal_pw")) and S.token_fp(r["portal_pw"]) == d.get("f"):
+        ss.role, ss.user_name, ss.member_id = "employee", r["name"], r["id"]
+
+
 def login_screen():
     c = st.columns([1, 1.2, 1])[1]
     with c:
@@ -160,6 +214,7 @@ def login_screen():
                         if hmac.compare_digest(typed.encode(), pw[role].encode()):
                             S.audit("login", "session", None, role, actor=name.strip() or "—", role=role)
                             st.session_state.role, st.session_state.user_name = role, name.strip()
+                            remember(S.make_session_token(role, name.strip(), None, S.token_fp(pw[role])))
                             st.rerun()
                         else:
                             S.audit("login_failed", "session", None, role, actor=name.strip() or "—", role=role)
@@ -177,6 +232,7 @@ def login_screen():
                         if m:
                             S.audit("login", "session", None, "employee", actor=m["name"], role="employee")
                             ss.role, ss.user_name, ss.member_id, ss.emp_fail = "employee", m["name"], m["id"], 0
+                            remember(S.make_session_token("employee", m["name"], m["id"], S.token_fp(m["portal_pw"])))
                             st.rerun()
                         else:
                             S.audit("login_failed", "session", None, f"employee nid ***{str(nid).strip()[-4:]}",
@@ -215,15 +271,83 @@ def page_dash():
     with b:
         st.subheader(t("per_policy"))
         rows = []
-        for no, school in S.CLIENTS_MAP.items():
+        for no, school in S.clients().items():
             m = members[members["policy_no"].astype(str) == no]
             rows.append({t("c_policy"): no, t("c_company"): school, t("n_active"): int((m["status"] == "active").sum()),
                          t("n_term"): int((m["status"] == "terminated").sum())})
         table(pd.DataFrame(rows))
 
 
+def schools_admin():
+    schools, provs = S.school_list(), S.provider_list()
+    names, NEW = [p["name"] for p in provs], "__new__"
+    with st.expander(t("sc_add")):
+        with st.form("sc_add_form", clear_on_submit=True):
+            c = st.columns(2)
+            name = c[0].text_input(t("sc_name"))
+            no = c[1].text_input(t("c_policy"))
+            choice = st.selectbox(t("sc_provider"), names + [NEW],
+                                  format_func=lambda x: t("sc_new_provider") if x == NEW else x)
+            c2 = st.columns(2)
+            new_name = c2[0].text_input(t("sc_new_name"))
+            email = c2[1].text_input(t("sc_email"))
+            st.caption(t("sc_add_hint"))
+            if st.form_submit_button(t("save")):
+                try:
+                    rec, e = S.add_school(name, no, new_name if choice == NEW else choice, email)
+                except Exception as ex:  # noqa: BLE001
+                    rec, e = None, None
+                    st.error(t("sc_fail").format(e=ex))
+                if e:
+                    st.error(t(e))
+                elif rec:
+                    flash("success", t("sc_added"))
+                    st.rerun()
+    with st.expander(t("sc_manage")):
+        table(pd.DataFrame([{t("c_policy"): no, t("sc_name"): s_["name"], t("sc_provider"): s_["provider"] or "—",
+                             t("sc_email"): S.provider_for(no)["email"] or "—",
+                             t("sc_status"): t("sc_on") if s_["active"] else t("sc_off")} for no, s_ in schools.items()]))
+        no = st.selectbox(t("c_policy"), list(schools), format_func=lambda n: f"{n} - {schools[n]['name']}", key="sc_pick")
+        cur = schools[no]
+        with st.form(f"sc_edit_{no}"):
+            nm = st.text_input(t("sc_name"), value=cur["name"])
+            pv = st.selectbox(t("sc_provider"), names, index=names.index(cur["provider"]) if cur["provider"] in names else 0)
+            act = st.checkbox(t("sc_active"), value=cur["active"])
+            if st.form_submit_button(t("save")):
+                try:
+                    e = S.update_school(no, nm, pv, act)
+                except Exception as ex:  # noqa: BLE001
+                    e = None
+                    st.error(t("sc_fail").format(e=ex))
+                if e:
+                    st.error(t(e))
+                else:
+                    flash("success", t("saved"))
+                    st.rerun()
+        st.divider()
+        st.subheader(t("sc_providers"))
+        pl = [p for p in provs if p["id"]]
+        if pl:
+            pp = st.selectbox(t("sc_provider"), pl, format_func=lambda p: p["name"], key="sc_prov_pick")
+            with st.form(f"sc_pemail_{pp['id']}"):
+                em = st.text_input(t("sc_email"), value=pp["email"] or "")
+                if st.form_submit_button(t("save")):
+                    try:
+                        e = S.set_provider_email(pp["id"], em)
+                    except Exception as ex:  # noqa: BLE001
+                        e = None
+                        st.error(t("sc_fail").format(e=ex))
+                    if e:
+                        st.error(t(e))
+                    else:
+                        flash("success", t("saved"))
+                        st.rerun()
+
+
 def page_policies():
     st.header(t("policies"))
+    if can_edit():
+        schools_admin()
     pol, members, reqs = S.policies_df(), S.load("members"), S.load("requests")
     members["status"] = members["status"].fillna("active")
     cols = st.columns(2)
@@ -237,7 +361,7 @@ def page_policies():
             st.markdown(f"""<div class="pcard">
 <div class="top"><span class="no">#{no}</span>{badge}</div>
 <div class="school">{html.escape(p["school"] or "—")}</div>
-<div style="font-size:13px;color:#5b6f70">{t("pol_provider")}: Allianz</div>
+<div style="font-size:13px;color:#5b6f70">{t("pol_provider")}: {html.escape(S.provider_for(no)["name"] or "—")}</div>
 <div class="box">{t("pol_start")}: <b>{S.fmt_date(p["start_date"])}</b> &nbsp;|&nbsp; {t("pol_end")}: <b>{S.fmt_date(p["end_date"])}</b></div>
 <div class="counts"><div><b>{int((m["status"] == "active").sum())}</b>{t("n_active")}</div>
 <div><b>{int((m["status"] == "terminated").sum())}</b>{t("n_term")}</div>
@@ -269,7 +393,7 @@ def add_member_tab():
     ss = st.session_state
     ss.setdefault("up_ver", 0)
     ss.setdefault("scan_ver", 0)
-    pol = st.selectbox(t("c_policy"), list(S.CLIENTS_MAP), format_func=policy_label, key="add_pol")
+    pol = st.selectbox(t("c_policy"), list(S.clients()), format_func=policy_label, key="add_pol")
     c1, c2 = st.columns(2)
     types = ["jpg", "jpeg", "png", "webp"]
     nid_file = c1.file_uploader(t("scan_nid"), type=types, key=f"up_nid_{ss.up_ver}")
@@ -350,7 +474,7 @@ def page_members():
     members, reqs = S.load("members"), S.load("requests")
     members["status"] = members["status"].fillna("active")
     f = st.columns([1.4, 1, 1, 1.4])
-    policy = f[0].selectbox(t("flt_policy"), ["*"] + list(S.CLIENTS_MAP), format_func=all_or(policy_label))
+    policy = f[0].selectbox(t("flt_policy"), ["*"] + list(S.clients()), format_func=all_or(policy_label))
     cat = f[1].selectbox(t("flt_cat"), ["*", "A", "B", "C", "D"], format_func=all_or(str))
     stt = f[2].selectbox(t("flt_status"), ["*", "active", "terminated"], format_func=all_or(lambda s: t("ms_" + s)))
     q = f[3].text_input(t("search"))
@@ -459,7 +583,7 @@ def card_bytes(m):
     pols = S.policies_df()
     row = pols[pols["policy_no"] == pol]
     start, end = (row.iloc[0]["start_date"], row.iloc[0]["end_date"]) if not row.empty else (None, None)
-    return cards.generate_card_pdf(m.to_dict() if hasattr(m, "to_dict") else m, S.CLIENTS_MAP.get(pol, ""), start, end)
+    return cards.generate_card_pdf(m.to_dict() if hasattr(m, "to_dict") else m, S.school_name(pol), start, end)
 
 
 def page_requests():
@@ -472,7 +596,7 @@ def page_requests():
                                          f"({len(reqs) if s == '*' else int(counts.get(s, 0))})")
     f = st.columns(3)
     typ = f[0].selectbox(t("rq_type"), ["*"] + S.REQ_TYPES, format_func=all_or(lambda x: t("ty_" + x)))
-    pol = f[1].selectbox(t("flt_policy"), ["*"] + list(S.CLIENTS_MAP), format_func=all_or(policy_label))
+    pol = f[1].selectbox(t("flt_policy"), ["*"] + list(S.clients()), format_func=all_or(policy_label))
     q = f[2].text_input(t("search"))
     v = reqs
     if sel != "*":
@@ -529,7 +653,7 @@ def page_import():
     st.header(t("import"))
     tab1, tab2 = st.tabs([t("tab_masters"), t("tab_files")])
     with tab1:
-        pol = st.selectbox(t("c_policy"), list(S.CLIENTS_MAP), format_func=policy_label, key="mp")
+        pol = st.selectbox(t("c_policy"), list(S.clients()), format_func=policy_label, key="mp")
         members = S.load("members")
         cur = members[members["policy_no"].astype(str) == pol].copy()
         if not cur.empty:
@@ -572,7 +696,7 @@ def page_import():
                             st.rerun()
     with tab2:
         c = st.columns(2)
-        pol = c[0].selectbox(t("c_policy"), list(S.CLIENTS_MAP), format_func=policy_label, key="fp")
+        pol = c[0].selectbox(t("c_policy"), list(S.clients()), format_func=policy_label, key="fp")
         rtype = c[1].radio(t("rq_type"), S.REQ_TYPES, format_func=lambda x: t("ty_" + x), horizontal=True, key="ft")
         reqs = S.load("requests")
         df = reqs[(reqs["type"] == rtype) & (reqs["policy_no"].astype(str) == pol) & (reqs["status"] == "draft")]
@@ -601,22 +725,27 @@ def page_import():
         if not sel.empty:
             kind = {"add": "Addition", "delete": "Deletion", "replace": "Card replacement",
                     "upgrade": "Tier upgrade"}[rtype]
-            school = S.CLIENTS_MAP.get(pol, "")
+            school = S.school_name(pol)
+            prov = S.provider_for(pol)
             subject = f"{kind} request - Policy {pol} - {school}"
-            body = (f"Dear Allianz Health Corporate team,\n\nPlease find attached the {kind.lower()} file for policy "
+            body = (f"Dear {prov['name'] or 'Insurance'} team,\n\nPlease find attached the {kind.lower()} file for policy "
                     f"{pol} ({school}) - {len(sel)} member(s).\nKindly process it and confirm once done.\n\n"
                     f"Best regards,\n{user()}")
-            st.link_button(t("files_mail"),
-                           f"mailto:{S.ALLIANZ_EMAIL}?subject={quote(subject)}&body={quote(body)}")
+            if not prov["email"]:
+                st.warning(t("files_no_email").format(p=prov["name"] or "—"))
+            if rtype in ("add", "delete") and (prov["name"] or "").casefold() != "allianz":
+                st.info(t("files_format_note"))
+            st.link_button(t("files_mail"), f"mailto:{prov['email']}?subject={quote(subject)}&body={quote(body)}")
             st.caption(t("files_mail_note"))
             with st.expander(t("files_mail_text")):
-                st.code(f"To: {S.ALLIANZ_EMAIL}\nSubject: {subject}\n\n{body}", language=None)
+                st.code(f"To: {prov['email'] or '—'}\nSubject: {subject}\n\n{body}", language=None)
 
 
 def page_settings():
     st.header(t("settings"))
-    st.write("**Providers:** " + ", ".join(S.PROVIDERS))
-    table(pd.DataFrame({t("c_policy"): list(S.CLIENTS_MAP), t("c_company"): list(S.CLIENTS_MAP.values())}))
+    st.write("**Providers:** " + ", ".join(S.provider_names()))
+    table(pd.DataFrame({t("c_policy"): list(S.clients()), t("c_company"): list(S.clients().values())}))
+    st.success(t("remember_on")) if S.secret_cookie() else st.warning(t("remember_off"))
     st.subheader(t("set_scan"))
     st.success(t("scan_ai_on")) if ocr.claude_available() else st.warning(t("scan_no_ai"))
     st.subheader(t("set_notif"))
@@ -690,13 +819,13 @@ def page_approvals():
                     mid = st.selectbox(t("choose_member"), list(lab), format_func=lab.get)
                     r1 = st.columns(2)
                     typ = r1[0].selectbox(t("ap_type"), S.APPROVAL_TYPES, format_func=lambda x: t("apt_" + x))
-                    prov = r1[1].selectbox(t("pol_provider"), S.PROVIDERS, index=S.PROVIDERS.index("Allianz"))
-                    r2 = st.columns(2)
-                    hosp = r2[0].text_input(t("ap_hospital"))
-                    amount = r2[1].number_input(t("ap_amount"), min_value=0.0, step=100.0)
+                    hosp = r1[1].text_input(t("ap_hospital"))
+                    amount = st.number_input(t("ap_amount"), min_value=0.0, step=100.0)
                     notes = st.text_input(t("f_details"))
                     if st.form_submit_button(t("ap_submit")):
-                        rec, e = S.create_approval(pool[pool["id"] == mid].iloc[0], typ, prov, hosp, amount, notes, user())
+                        mrow = pool[pool["id"] == mid].iloc[0]
+                        rec, e = S.create_approval(mrow, typ, S.provider_for(mrow["policy_no"])["name"] or "Allianz",
+                                                   hosp, amount, notes, user())
                         if e:
                             st.error(t(e))
                         else:
@@ -878,7 +1007,7 @@ def page_employee():
     stat(c[0], S.nn(m["category"]) or "—", t("c_cat"))
     stat(c[1], S.nn(m["dependency"]) or "—", t("c_dep"))
     stat(c[2], t("ms_" + status), t("c_mstatus"), gold=True)
-    stat(c[3], pol, S.CLIENTS_MAP.get(pol, ""))
+    stat(c[3], pol, S.school_name(pol))
     st.write("")
     info = {t("c_name"): m["name"], t("c_staff"): S.nn(m["staff_no"]) or "—", t("c_card"): S.nn(m["card_no"]) or "—",
             t("c_dob"): S.fmt_date(m["dob"]), t("c_gender"): t("g_" + m["gender"]) if m["gender"] in ("M", "F") else "—",
@@ -930,6 +1059,8 @@ def logout_button():
     if st.button(t("logout")):
         for k in ("role", "user_name", "member_id", "_new_code"):
             st.session_state.pop(k, None)
+        st.session_state["_cookie_out"] = ("clear", None)
+        st.session_state["_no_auto"] = True  # عشان الكوكي القديم ما يدخّلوش تاني قبل ما يتمسح
         st.rerun()
 
 
@@ -948,6 +1079,8 @@ def main():
     with st.sidebar:
         st.radio("lang", ["العربية", "English"], horizontal=True, key="lang_label", label_visibility="collapsed")
     inject_css()
+    try_auto_login()
+    emit_cookie()
     if "role" not in st.session_state:
         login_screen()
         return
